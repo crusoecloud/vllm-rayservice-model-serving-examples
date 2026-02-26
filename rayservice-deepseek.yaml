@@ -1,0 +1,196 @@
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: deepseek-rayservice
+  namespace: default
+spec:
+  serviceUnhealthySecondThreshold: 900
+  deploymentUnhealthySecondThreshold: 300
+
+  # Service configuration for model serving
+  serveConfigV2: |
+    applications:
+      - name: deepseek-llm
+        import_path: deployment:deployment
+        runtime_env:
+          pip:
+            - vllm>=0.4.0
+            - transformers>=4.38.0
+            - torch>=2.1.0
+          env_vars:
+            HF_TOKEN: "YOUR_HUGGINGFACE_TOKEN_HERE"
+        deployments:
+          - name: DeepSeekModel
+            num_replicas: 1
+            ray_actor_options:
+              num_gpus: 8
+            user_config:
+              model: "deepseek-ai/deepseek-coder-33b-instruct"
+              # Alternative models:
+              # "deepseek-ai/deepseek-llm-67b-chat"
+              # "deepseek-ai/DeepSeek-V2"
+              tensor_parallel_size: 8
+              max_model_len: 4096
+              gpu_memory_utilization: 0.95
+
+  rayClusterConfig:
+    # Ray head node configuration
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: '0.0.0.0'
+        num-cpus: '0'
+        block: 'true'
+      template:
+        spec:
+          containers:
+          - name: ray-head
+            image: rayproject/ray-ml:2.9.0-gpu
+            imagePullPolicy: IfNotPresent
+            ports:
+            - containerPort: 6379
+              name: gcs-server
+            - containerPort: 8265
+              name: dashboard
+            - containerPort: 10001
+              name: client
+            - containerPort: 8000
+              name: serve
+            env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: huggingface-secret
+                  key: token
+            - name: RAY_GRAFANA_IFRAME_HOST
+              value: http://127.0.0.1:3000
+            - name: RAY_PROMETHEUS_HOST
+              value: http://prometheus-server:9090
+            volumeMounts:
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+            - name: ray-logs
+              mountPath: /tmp/ray
+            resources:
+              limits:
+                cpu: "8"
+                memory: "32Gi"
+              requests:
+                cpu: "4"
+                memory: "16Gi"
+          volumes:
+          - name: hf-cache
+            emptyDir: {}
+          - name: ray-logs
+            emptyDir: {}
+
+    # Worker group with GPU nodes
+    workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 2  # 2 worker nodes
+      minReplicas: 2
+      maxReplicas: 2
+      rayStartParams:
+        block: 'true'
+        num-cpus: '16'
+        num-gpus: '8'
+      template:
+        spec:
+          # Ensure workers are spread across different nodes
+          topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                ray.io/group: gpu-workers
+
+          containers:
+          - name: ray-worker
+            image: rayproject/ray-ml:2.9.0-gpu
+            imagePullPolicy: IfNotPresent
+            env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: huggingface-secret
+                  key: token
+            - name: RAY_GRAFANA_IFRAME_HOST
+              value: http://127.0.0.1:3000
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0,1,2,3,4,5,6,7"
+            volumeMounts:
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+            - name: ray-logs
+              mountPath: /tmp/ray
+            - name: shm
+              mountPath: /dev/shm
+            resources:
+              limits:
+                cpu: "64"
+                memory: "512Gi"
+                nvidia.com/gpu: "8"  # 8 H100 GPUs per worker
+              requests:
+                cpu: "32"
+                memory: "256Gi"
+                nvidia.com/gpu: "8"
+
+          volumes:
+          - name: hf-cache
+            emptyDir:
+              sizeLimit: 100Gi
+          - name: ray-logs
+            emptyDir: {}
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi  # Shared memory for multi-GPU communication
+
+          # Node affinity to ensure GPU nodes are selected
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                    - NVIDIA-H100-80GB-HBM3
+                    - NVIDIA-H100-PCIE-80GB
+                    - H100-80GB-HBM3
+
+          tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+---
+# HuggingFace token secret (create this separately)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: huggingface-secret
+  namespace: default
+type: Opaque
+stringData:
+  token: "YOUR_HUGGINGFACE_TOKEN_HERE"
+---
+# Service to expose the Ray Serve endpoint
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepseek-serve
+  namespace: default
+spec:
+  selector:
+    ray.io/cluster: deepseek-rayservice
+    ray.io/node-type: head
+  ports:
+  - name: serve
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+  - name: dashboard
+    port: 8265
+    targetPort: 8265
+    protocol: TCP
+  type: LoadBalancer
