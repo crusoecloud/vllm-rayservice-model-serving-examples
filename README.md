@@ -1,16 +1,16 @@
 # DeepSeek R1 (70B) on Kubernetes with KubeRay
 
-Deploys `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` via Ray Serve's built-in OpenAI-compatible API (`ray.serve.llm`), backed by vLLM with tensor parallelism across 8 GPUs per replica.
+This example deploys `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` via Ray Serve's built-in OpenAI-compatible API (`ray.serve.llm`), backed by vLLM with tensor parallelism across 8 GPUs per replica, on a Crusoe Managed Kubernetes cluster with a GPU nodepool. You can adjust the number of nodes, and number of gpus per node, by editing the spec of the ray service in the yaml file. Most Crusoe GPU SKUs have 8 GPUs per node, apart from GB200 which has 4.
 
-**Hardware requirement:** 2 worker nodes, each with 8× NVIDIA H100/A100 (80 GB) GPUs.
+**Hardware requirement:** 2 or more worker nodes, each with 8× NVIDIA H100/A100 (80 GB) GPUs. (adjust yaml file accordingly)
 
 ---
 
 ## Prerequisites
 
-- Kubernetes cluster with GPU nodes (NVIDIA device plugin or GPU Operator installed)
-- `helm` ≥ 3.x and `kubectl` configured against your cluster
-- A [HuggingFace](https://huggingface.co/settings/tokens) token with access to `deepseek-ai/DeepSeek-R1-Distill-Llama-70B`
+- CMK cluster with GPU nodes (NVIDIA device plugin or GPU Operator installed by selecting appropriate addons at cluster creation time)
+- `helm` ≥ 3.x and `kubectl` configured against your cluster. [Instructions for installing Helm](https://helm.sh/docs/intro/install/).
+- (not currently required) A [HuggingFace](https://huggingface.co/settings/tokens) token with access to `deepseek-ai/DeepSeek-R1-Distill-Llama-70B`
 
 ---
 
@@ -18,7 +18,7 @@ Deploys `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` via Ray Serve's built-in Ope
 
 ### CRDs
 
-Helm does not upgrade CRDs automatically on `helm upgrade`. Apply them explicitly every time (safe to re-apply):
+You need an up-to-date KubeRay version for this example to work - this example is tested with 1.5.1. Helm does not upgrade CRDs automatically when you run `helm upgrade` for KubeRay, so check your current KubeRay operator version with `helm list -A|grep -i kuberay` and if you need to helm upgrade it, then also do the step of upgrading the CRDs. If this is your first installatin of KubeRay then the correct CRDs will automatically be installed.
 
 ```bash
 kubectl apply --server-side -k \
@@ -64,15 +64,8 @@ kubectl -n kuberay-system get pods
 
 ## 2. Update the HuggingFace Token
 
-The manifest (`ray-service.llm-serve.yaml`) contains a `Secret` with a placeholder token. Replace it before applying:
-
-```bash
-# In-place edit (macOS requires an extension for -i)
-sed -i '' 's|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|hf_YOUR_ACTUAL_TOKEN|' \
-  ray-service.llm-serve.yaml
-```
-
-Or edit the `stringData.hf_token` field in the file directly.
+At the time of writing, the DeepSeek model is not gated by an HF token so this part doesn't seem to matter, but if you want to try other models, it probably will.  
+The manifest (`ray-service.llm-serve.yaml`) contains a `Secret` with a placeholder token. Replace it before applying the yaml, by editing the `stringData.hf_token` field in the yaml file directly.
 
 ---
 
@@ -131,7 +124,7 @@ Dashboard at `http://localhost:8265`.
 
 ### Option B — LoadBalancer service
 
-Patch the serve service to type `LoadBalancer`:
+Patch the serve service to type `LoadBalancer. In CMK, Load Balancers are controlled by feature flags and quotas, so contact Crusoe if you haven't used them before:
 
 ```bash
 kubectl patch svc ray-serve-llm-serve-svc \
