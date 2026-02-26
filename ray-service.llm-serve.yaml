@@ -1,0 +1,97 @@
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: ray-serve-llm
+spec:
+  serveConfigV2: |
+    applications:
+    - name: llms
+      import_path: ray.serve.llm:build_openai_app
+      route_prefix: "/"
+      args:
+        llm_configs:
+        - model_loading_config:
+            model_id: deepseek-r1-distill-llama-70b
+            model_source: deepseek-ai/DeepSeek-R1-Distill-Llama-70B
+          engine_kwargs:
+            dtype: bfloat16
+            max_model_len: 32768
+            gpu_memory_utilization: 0.90
+            tensor_parallel_size: 8
+          deployment_config:
+            autoscaling_config:
+              min_replicas: 1
+              max_replicas: 2
+              target_ongoing_requests: 16
+            max_ongoing_requests: 32
+  rayClusterConfig:
+    rayVersion: "2.52.0"
+    headGroupSpec:
+      rayStartParams:
+        num-cpus: "0"
+        num-gpus: "0"
+      template:
+        spec:
+          containers:
+          - name: ray-head
+            image: rayproject/ray-llm:2.52.0-py311-cu128
+            ports:
+            - containerPort: 8000
+              name: serve
+              protocol: TCP
+            - containerPort: 8080
+              name: metrics
+              protocol: TCP
+            - containerPort: 6379
+              name: gcs
+              protocol: TCP
+            - containerPort: 8265
+              name: dashboard
+              protocol: TCP
+            - containerPort: 10001
+              name: client
+              protocol: TCP
+            resources:
+              limits:
+                cpu: "2"
+                memory: "5Gi"
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+    workerGroupSpecs:
+    - replicas: 2
+      minReplicas: 2
+      maxReplicas: 2
+      groupName: gpu-group
+      rayStartParams:
+        num-gpus: "8"
+      template:
+        spec:
+          containers:
+          - name: ray-worker
+            image: rayproject/ray-llm:2.52.0-py311-cu128
+            env:
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: hf_token
+            resources:
+              limits:
+                cpu: "96"
+                memory: "192Gi"
+                nvidia.com/gpu: "8"
+              requests:
+                cpu: "96"
+                memory: "192Gi"
+                nvidia.com/gpu: "8"
+
+---
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hf-token
+type: Opaque
+stringData:
+  hf_token: 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

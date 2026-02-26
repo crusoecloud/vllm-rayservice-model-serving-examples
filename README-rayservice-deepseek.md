@@ -1,347 +1,250 @@
-# DeepSeek Model Deployment on Kubernetes with KubeRay
+# DeepSeek R1 (70B) on Kubernetes with KubeRay
 
-This repository contains configuration files for deploying a DeepSeek LLM model on Kubernetes using the KubeRay operator with 16 NVIDIA H100 GPUs (8 GPUs per worker node across 2 nodes).
+Deploys `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` via Ray Serve's built-in OpenAI-compatible API (`ray.serve.llm`), backed by vLLM with tensor parallelism across 8 GPUs per replica.
+
+**Hardware requirement:** 2 worker nodes, each with 8× NVIDIA H100/A100 (80 GB) GPUs.
+
+---
 
 ## Prerequisites
 
-1. **Kubernetes cluster** with:
-   - KubeRay operator installed
-   - At least 2 worker nodes with 8x NVIDIA H100 GPUs each
-   - NVIDIA GPU operator or device plugin installed
-   - Storage provisioner for persistent volumes (optional)
+- Kubernetes cluster with GPU nodes (NVIDIA device plugin or GPU Operator installed)
+- `helm` ≥ 3.x and `kubectl` configured against your cluster
+- A [HuggingFace](https://huggingface.co/settings/tokens) token with access to `deepseek-ai/DeepSeek-R1-Distill-Llama-70B`
 
-2. **HuggingFace Access Token**:
-   - Create an account at https://huggingface.co
-   - Generate an access token at https://huggingface.co/settings/tokens
-   - Ensure you have accepted the DeepSeek model license
+---
 
-3. **kubectl** configured to access your cluster
+## 1. Install or Upgrade the KubeRay Operator
 
-## Files
+### CRDs
 
-- `rayservice-deepseek.yaml` - RayService manifest with GPU configuration
-- `deployment.py` - Ray Serve deployment script using vLLM
-- `README-rayservice-deepseek.md` - This file
-
-## Configuration Steps
-
-### 1. Update HuggingFace Token
-
-Replace `YOUR_HUGGINGFACE_TOKEN_HERE` in the Secret section of `rayservice-deepseek.yaml`:
+Helm does not upgrade CRDs automatically on `helm upgrade`. Apply them explicitly every time (safe to re-apply):
 
 ```bash
-# Option 1: Edit the YAML file directly
-sed -i "s/YOUR_HUGGINGFACE_TOKEN_HERE/hf_YOUR_ACTUAL_TOKEN/" rayservice-deepseek.yaml
-
-# Option 2: Create the secret separately
-kubectl create secret generic huggingface-secret \
-  --from-literal=token=hf_YOUR_ACTUAL_TOKEN \
-  -n default
+kubectl apply --server-side -k \
+  "github.com/ray-project/kuberay/ray-operator/config/crd?ref=v1.5.1"
 ```
 
-### 2. Choose Your DeepSeek Model
+This installs/upgrades the three CRDs:
+- `rayclusters.ray.io`
+- `rayjobs.ray.io`
+- `rayservices.ray.io`
 
-Edit the `serveConfigV2` section in `rayservice-deepseek.yaml` to select your model:
+### Operator
 
-Available models:
-- `deepseek-ai/deepseek-coder-33b-instruct` (default, coding-focused)
-- `deepseek-ai/deepseek-llm-67b-chat` (general chat)
-- `deepseek-ai/DeepSeek-V2` (latest, requires more resources)
-- `deepseek-ai/DeepSeek-V3` (if available)
-
-### 3. Adjust GPU Node Affinity (if needed)
-
-Update the node affinity section in the worker spec to match your H100 GPU product name:
-
-```yaml
-nodeAffinity:
-  requiredDuringSchedulingIgnoredDuringExecution:
-    nodeSelectorTerms:
-    - matchExpressions:
-      - key: nvidia.com/gpu.product
-        operator: In
-        values:
-        - NVIDIA-H100-80GB-HBM3  # Update to match your GPU model
-```
-
-To find your GPU product name:
-```bash
-kubectl get nodes -o json | jq '.items[].status.allocatable | keys[] | select(. | startswith("nvidia"))'
-kubectl describe node <node-name> | grep -i gpu
-```
-
-## Deployment
-
-### 1. Create a ConfigMap for the Deployment Script
+**Fresh install:**
 
 ```bash
-kubectl create configmap deepseek-deployment \
-  --from-file=deployment.py \
-  -n default
+helm repo add kuberay https://ray-project.github.io/kuberay-helm/
+helm repo update
+
+helm install kuberay-operator kuberay/kuberay-operator \
+  --namespace kuberay-system \
+  --create-namespace \
+  --version 1.5.1
 ```
 
-Alternatively, build the deployment script into a custom Docker image or use Ray's working_dir feature.
-
-### 2. Deploy the RayService
+**Upgrade an existing installation:**
 
 ```bash
-kubectl apply -f rayservice-deepseek.yaml
+helm repo update
+
+helm upgrade kuberay-operator kuberay/kuberay-operator \
+  --namespace kuberay-system \
+  --version 1.5.1
 ```
 
-### 3. Monitor Deployment
+Verify the operator is running:
 
 ```bash
-# Check RayService status
-kubectl get rayservice deepseek-rayservice -n default
-
-# Check pods
-kubectl get pods -n default -l ray.io/cluster=deepseek-rayservice
-
-# View logs from head node
-kubectl logs -f -n default -l ray.io/node-type=head
-
-# View Ray dashboard
-kubectl port-forward -n default svc/deepseek-serve 8265:8265
-# Open http://localhost:8265
+kubectl -n kuberay-system get pods
 ```
 
-### 4. Verify GPU Allocation
+---
+
+## 2. Update the HuggingFace Token
+
+The manifest (`ray-service.llm-serve.yaml`) contains a `Secret` with a placeholder token. Replace it before applying:
 
 ```bash
-# Check GPU allocation on worker pods
-kubectl exec -it <worker-pod-name> -n default -- nvidia-smi
-
-# Verify Ray can see the GPUs
-kubectl exec -it <head-pod-name> -n default -- python -c "import ray; ray.init(); print(ray.available_resources())"
+# In-place edit (macOS requires an extension for -i)
+sed -i '' 's|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|hf_YOUR_ACTUAL_TOKEN|' \
+  ray-service.llm-serve.yaml
 ```
 
-## Usage
+Or edit the `stringData.hf_token` field in the file directly.
 
-### Access the Model API
+---
+
+## 3. Deploy the RayService
 
 ```bash
-# Port forward the serve endpoint
-kubectl port-forward -n default svc/deepseek-serve 8000:8000
+kubectl apply -f ray-service.llm-serve.yaml
 ```
 
-### Send Inference Requests
+This creates:
+- A `RayService` named `ray-serve-llm` in the `default` namespace
+- A `RayCluster` (head + 2 GPU worker nodes) managed by KubeRay
+- The `hf-token` secret
+
+### Monitor rollout
 
 ```bash
-# Using curl
-curl -X POST http://localhost:8000/ \
+# Overall RayService status (wait for READY)
+kubectl get rayservice ray-serve-llm -w
+
+# Pods
+kubectl get pods -l ray.io/cluster -w
+
+# Head node logs (Ray Serve startup)
+kubectl logs -f -l ray.io/node-type=head --container ray-head
+
+# Worker logs (model download + vLLM init)
+kubectl logs -f -l ray.io/node-type=worker --container ray-worker
+```
+
+Model download is ~140 GB; initial startup takes several minutes. The service is ready when `kubectl get rayservice ray-serve-llm` shows `READY: True`.
+
+---
+
+## 4. Access the API
+
+KubeRay creates two services for `ray-serve-llm`:
+
+| Service | Ports |
+|---|---|
+| `ray-serve-llm-head-svc` | 8265 (dashboard), 6379 (GCS), 10001 (client) |
+| `ray-serve-llm-serve-svc` | 8000 (Serve / OpenAI API) |
+
+### Option A — Port forwarding (quickest for local testing)
+
+```bash
+# OpenAI-compatible API
+kubectl port-forward svc/ray-serve-llm-serve-svc 8000:8000
+
+# Ray dashboard (separate terminal)
+kubectl port-forward svc/ray-serve-llm-head-svc 8265:8265
+```
+
+API is then available at `http://localhost:8000`.
+Dashboard at `http://localhost:8265`.
+
+### Option B — LoadBalancer service
+
+Patch the serve service to type `LoadBalancer`:
+
+```bash
+kubectl patch svc ray-serve-llm-serve-svc \
+  -p '{"spec": {"type": "LoadBalancer"}}'
+```
+
+Wait for an external IP to be assigned:
+
+```bash
+kubectl get svc ray-serve-llm-serve-svc -w
+```
+
+Once assigned, use that IP in place of `localhost:8000` in all commands below.
+
+---
+
+## 5. Test with curl
+
+All examples use `http://localhost:8000` (port-forward) — substitute the LoadBalancer IP/hostname if using Option B.
+
+### List available models
+
+```bash
+curl http://localhost:8000/v1/models
+```
+
+### Basic chat completion
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "Write a Python function to calculate fibonacci numbers",
-    "max_tokens": 512,
-    "temperature": 0.7,
-    "top_p": 0.9
+    "model": "deepseek-r1-distill-llama-70b",
+    "messages": [
+      {"role": "user", "content": "What is the capital of France?"}
+    ],
+    "max_tokens": 512
   }'
 ```
 
-```python
-# Using Python
-import requests
-
-response = requests.post(
-    "http://localhost:8000/",
-    json={
-        "prompt": "Explain how transformers work in deep learning",
-        "max_tokens": 1024,
-        "temperature": 0.7,
-        "top_p": 0.95
-    }
-)
-
-print(response.json()["generated_text"])
-```
-
-### OpenAI-Compatible API (Optional)
-
-To use an OpenAI-compatible API, modify `deployment.py` to use vLLM's OpenAI server:
-
-```python
-from vllm.entrypoints.openai.api_server import run_server
-```
-
-Or deploy vLLM directly:
-```bash
-kubectl exec -it <head-pod-name> -- \
-  python -m vllm.entrypoints.openai.api_server \
-  --model deepseek-ai/deepseek-coder-33b-instruct \
-  --tensor-parallel-size 8 \
-  --host 0.0.0.0 \
-  --port 8000
-```
-
-## Scaling and Performance Tuning
-
-### Tensor Parallelism
-
-The configuration uses `tensor_parallel_size: 8` to distribute the model across 8 GPUs on a single worker. For the second worker:
-
-- Increase `num_replicas` in the serve config to use both workers
-- Each replica will use 8 GPUs
-- Total: 2 replicas × 8 GPUs = 16 GPUs
-
-### Memory Optimization
-
-Adjust in `deployment.py`:
-```python
-gpu_memory_utilization: 0.95  # Increase if you have memory issues
-max_model_len: 4096          # Reduce for longer sequences
-```
-
-### Batch Size
-
-Modify vLLM settings for throughput:
-```python
-self.llm = LLM(
-    model=model,
-    max_num_batched_tokens=8192,  # Adjust based on GPU memory
-    max_num_seqs=256,             # Maximum batch size
-    ...
-)
-```
-
-## Troubleshooting
-
-### Pods Not Scheduling
+### Streaming response
 
 ```bash
-# Check node resources
-kubectl describe nodes | grep -A 5 "Allocated resources"
-
-# Check GPU availability
-kubectl get nodes -o custom-columns=NAME:.metadata.name,GPUs:.status.allocatable."nvidia\.com/gpu"
-
-# Check pod events
-kubectl describe pod <pod-name> -n default
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-r1-distill-llama-70b",
+    "messages": [
+      {"role": "user", "content": "Solve step by step: if 3x + 7 = 22, what is x?"}
+    ],
+    "max_tokens": 2048,
+    "stream": true
+  }'
 ```
 
-### Out of Memory Errors
-
-- Reduce `gpu_memory_utilization` to 0.85 or 0.9
-- Decrease `max_model_len`
-- Reduce `max_num_batched_tokens`
-- Check if the model fits on 8 H100s (67B models typically need ~134GB)
-
-### Model Download Issues
+### Multi-turn conversation with system prompt
 
 ```bash
-# Check if HF_TOKEN is set correctly
-kubectl exec -it <pod-name> -- env | grep HF_TOKEN
-
-# Manually test HuggingFace access
-kubectl exec -it <pod-name> -- python3 -c "from huggingface_hub import login; login(token='YOUR_TOKEN')"
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-r1-distill-llama-70b",
+    "messages": [
+      {"role": "system", "content": "You are a concise assistant. Answer briefly."},
+      {"role": "user", "content": "Explain gradient descent."},
+      {"role": "assistant", "content": "Gradient descent minimizes a loss function by iteratively stepping in the direction of the negative gradient."},
+      {"role": "user", "content": "How does learning rate affect it?"}
+    ],
+    "max_tokens": 1024,
+    "temperature": 0.6
+  }'
 ```
 
-### Worker Pods on Same Node
+### Reasoning-heavy prompt
 
-If topology spread isn't working:
-```bash
-# Check node labels
-kubectl get nodes --show-labels
-
-# Manually add node affinity
-kubectl label nodes <node-1> gpu-zone=zone-1
-kubectl label nodes <node-2> gpu-zone=zone-2
-```
-
-Then update the worker spec to use the label.
-
-## Cleanup
+DeepSeek-R1 emits `<think>...</think>` tokens before its final answer. Stream this to observe the chain of thought in real time:
 
 ```bash
-# Delete the RayService
-kubectl delete -f rayservice-deepseek.yaml
-
-# Delete the secret
-kubectl delete secret huggingface-secret -n default
-
-# Delete the configmap (if created)
-kubectl delete configmap deepseek-deployment -n default
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-r1-distill-llama-70b",
+    "messages": [
+      {"role": "user", "content": "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost?"}
+    ],
+    "max_tokens": 4096,
+    "temperature": 0.6,
+    "stream": true
+  }'
 ```
 
-## Advanced Configuration
+> **Tip:** Use `temperature` 0.5–0.7 for reasoning tasks. Avoid `temperature: 0` — it can produce repetitive output with R1 models.
 
-### Using Multiple Worker Groups
+---
 
-For heterogeneous GPU setups or different model configurations:
-
-```yaml
-workerGroupSpecs:
-- groupName: gpu-workers-a100
-  replicas: 2
-  rayStartParams:
-    num-gpus: '8'
-  template:
-    spec:
-      containers:
-      - name: ray-worker
-        resources:
-          limits:
-            nvidia.com/gpu: "8"
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: nvidia.com/gpu.product
-                operator: In
-                values:
-                - NVIDIA-A100-SXM4-80GB
-```
-
-### Persistent Model Caching
-
-To avoid re-downloading the model on pod restarts:
-
-```yaml
-volumes:
-- name: hf-cache
-  persistentVolumeClaim:
-    claimName: huggingface-cache-pvc
-```
-
-Create PVC:
-```bash
-kubectl apply -f - <<EOF
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: huggingface-cache-pvc
-  namespace: default
-spec:
-  accessModes:
-  - ReadWriteMany
-  resources:
-    requests:
-      storage: 500Gi
-  storageClassName: your-storage-class
-EOF
-```
-
-## Monitoring
-
-### Prometheus Metrics
-
-Ray exposes metrics at `http://<head-node>:8265/metrics`
+## 6. Cleanup
 
 ```bash
-kubectl port-forward -n default svc/deepseek-serve 8265:8265
-curl http://localhost:8265/metrics
+kubectl delete -f ray-service.llm-serve.yaml
 ```
 
-### GPU Metrics
+To also remove the CRDs and operator:
 
-Use NVIDIA DCGM exporter for GPU metrics:
 ```bash
-helm install dcgm-exporter nvidia/dcgm-exporter --namespace gpu-operator
+helm uninstall kuberay-operator -n kuberay-system
+kubectl delete -k "github.com/ray-project/kuberay/ray-operator/config/crd?ref=v1.5.1"
 ```
+
+---
 
 ## References
 
-- [KubeRay Documentation](https://docs.ray.io/en/latest/cluster/kubernetes/index.html)
-- [vLLM Documentation](https://docs.vllm.ai/)
-- [DeepSeek Models](https://huggingface.co/deepseek-ai)
-- [Ray Serve Documentation](https://docs.ray.io/en/latest/serve/index.html)
+- [KubeRay Helm chart](https://github.com/ray-project/kuberay/tree/master/helm-chart/kuberay-operator)
+- [Ray Serve LLM docs](https://docs.ray.io/en/latest/serve/llm/serving-llms.html)
+- [vLLM documentation](https://docs.vllm.ai/)
+- [DeepSeek-R1-Distill-Llama-70B on HuggingFace](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-70B)
